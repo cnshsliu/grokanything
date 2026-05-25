@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+grokanything - Send text or file content to Grok via Chrome CDP.
+
+Usage:
+    grokanything "your question here"
+    grokanything /path/to/file.md
+
+Requires Chrome running with --remote-debugging-port=9222
+and user logged into grok.com.
+
+Uses a dedicated background Grok tab. Never steals focus or activates tabs.
+Each call starts a new conversation in that tab.
+"""
+
+import sys
+import os
+import json
+import asyncio
+
+# Allow importing cdp_helper from the same bin directory
+_BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BIN_DIR not in sys.path:
+    sys.path.insert(0, _BIN_DIR)
+
+from cdp_helper import get_tabs, find_tab, CDPClient
+import urllib.request
+
+CDP_PORT = 9222
+
+
+def _read_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+HELP_TEXT = """Usage: grokanything [OPTIONS] <text or file-path>
+
+Send a question or file content to Grok via Chrome CDP.
+
+Options:
+  -h, --help    Show this help message
+
+Arguments:
+  text          Question to ask Grok
+  file-path     Path to a file; its content will be sent to Grok
+
+Requirements:
+  - Chrome running with --remote-debugging-port=9222
+  - A grok.com tab open in Chrome
+
+Examples:
+  grokanything "What is the capital of France?"
+  grokanything /path/to/document.md
+  grokanything ~/Documents/my-code.py
+  grokanything Summarize the following text...
+
+File support:
+  If the argument is an existing file path, the file content is read and
+  sent to Grok. Works with any text file (.py, .md, .txt, .json, etc.).
+"""
+
+
+def _resolve_content(args: list[str]) -> str:
+    """Treat first arg as file if it exists, otherwise join all args as text."""
+    if not args or args[0] in ("-h", "--help"):
+        print(HELP_TEXT)
+        sys.exit(0 if args else 1)
+
+    first = args[0]
+    if os.path.isfile(first):
+        content = _read_file(first)
+        print(f"📄 Read file: {first} ({len(content)} chars)", file=sys.stderr)
+        return content
+    else:
+        return " ".join(args)
+
+
+def _find_grok_tab() -> dict | None:
+    """Find an existing grok.com tab to reuse."""
+    for t in get_tabs(port=CDP_PORT):
+        url = t.get("url", "")
+        if url.startswith("https://grok.com") and "images/" not in url:
+            return t
+    return None
+
+
+async def _create_background_tab() -> tuple[str, str]:
+    """Create a new tab with focus=false to avoid stealing foreground."""
+    import websockets
+
+    ver = json.loads(urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version").read())
+    browser_ws = ver["webSocketDebuggerUrl"]
+
+    async with websockets.connect(browser_ws, max_size=10 * 1024 * 1024) as ws:
+        msg = {
+            "id": 1,
+            "method": "Target.createTarget",
+            "params": {
+                "url": "about:blank",
+                "background": True,
+                "focus": False,
+            }
+        }
+        await ws.send(json.dumps(msg))
+        resp = json.loads(await ws.recv())
+        target_id = resp["result"]["targetId"]
+
+    await asyncio.sleep(1)
+    tabs = json.loads(urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/list").read())
+    tab = next((t for t in tabs if t.get("id") == target_id), None)
+    if not tab:
+        raise RuntimeError(f"Created tab {target_id} not found")
+
+    print(f"🆕 Opened background tab: {target_id[:8]}", file=sys.stderr)
+    return target_id, tab["webSocketDebuggerUrl"]
+
+
+async def _close_tab(target_id: str):
+    """Close a tab via CDP Target.closeTarget."""
+    import websockets
+
+    ver = json.loads(urllib.request.urlopen(f"http://localhost:{CDP_PORT}/json/version").read())
+    browser_ws = ver["webSocketDebuggerUrl"]
+
+    async with websockets.connect(browser_ws, max_size=10 * 1024 * 1024) as ws:
+        msg = {"id": 1, "method": "Target.closeTarget", "params": {"targetId": target_id}}
+        await ws.send(json.dumps(msg))
+        await ws.recv()
+    print("🗑️  Closed tab", file=sys.stderr)
+
+
+async def _wait_until_idle(cdp: CDPClient, timeout: int = 300):
+    """Wait until Grok is not generating (no Stop button visible)."""
+    elapsed = 0
+    while elapsed < timeout:
+        result = await cdp.evaluate_json("""
+        (() => {
+            const stopBtn = document.querySelector('button[aria-label="Stop"]');
+            return { busy: !!stopBtn };
+        })()
+        """)
+        if not result or not result.get("busy"):
+            return
+        await asyncio.sleep(2)
+        elapsed += 2
+    print(f"⚠️  Still busy after {timeout}s, proceeding anyway", file=sys.stderr)
+
+
+async def _inject_and_submit(cdp: CDPClient, text: str):
+    """Inject text into Grok's ProseMirror editor and submit."""
+    escaped = json.dumps(text)
+
+    result = await cdp.evaluate_json(f"""
+    (() => {{
+      const pm = document.querySelector('.ProseMirror');
+      if (!pm) return {{ ok: false, error: 'ProseMirror not found' }};
+      pm.focus();
+      const p = pm.querySelector('p');
+      if (p) {{
+        p.textContent = {escaped};
+        p.classList.remove('is-empty', 'is-editor-empty');
+        pm.dispatchEvent(new InputEvent('input', {{
+          bubbles: true, cancelable: true, inputType: 'insertText', data: {escaped},
+        }}));
+      }}
+      return {{ ok: true }};
+    }})()
+    """)
+
+    if not result or not result.get("ok"):
+        err = result.get("error", "unknown") if result else "unknown"
+        print(f"❌ Failed to inject text: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    print("📝 Text injected", file=sys.stderr)
+
+    await cdp.dispatch_key_event(
+        key="Enter", code="Enter", key_code=13, windows_virtual_key_code=13,
+    )
+    print("⏎ Submitted. Waiting for response...", file=sys.stderr)
+
+
+async def _wait_for_response(cdp: CDPClient, timeout: int = 300) -> str:
+    """Wait for Grok to finish responding and return the response text."""
+    # Phase 1: Wait for response to appear (up to 30s)
+    for attempt in range(30):
+        result = await cdp.evaluate_json("""
+        (() => {
+            const els = document.querySelectorAll('.response-content-markdown.markdown');
+            return { count: els.length };
+        })()
+        """)
+        if result and result.get("count", 0) > 0:
+            break
+        await asyncio.sleep(1)
+
+    if not result or result.get("count", 0) == 0:
+        print("⚠️  No response appeared within 30s", file=sys.stderr)
+        return ""
+
+    # Phase 2: Wait for generation to complete (content stabilizes)
+    prev_len = 0
+    stable_count = 0
+    elapsed = 0
+    while elapsed < timeout:
+        await asyncio.sleep(3)
+        elapsed += 3
+
+        length = await cdp.evaluate("""
+        document.querySelectorAll('.response-content-markdown.markdown').length > 0
+            ? document.querySelectorAll('.response-content-markdown.markdown')[
+                  document.querySelectorAll('.response-content-markdown.markdown').length - 1
+              ].textContent.length
+            : 0
+        """)
+        curr_len = int(length) if length else 0
+
+        if curr_len == prev_len and curr_len > 50:
+            stable_count += 1
+            if stable_count >= 3:
+                print(f"✅ Response complete ({curr_len} chars, {elapsed}s)", file=sys.stderr)
+                break
+        else:
+            stable_count = 0
+        prev_len = curr_len
+
+    # Phase 3: Extract response text in chunks
+    await cdp.evaluate("""
+    (() => {
+        const els = document.querySelectorAll('.response-content-markdown.markdown');
+        if (els.length > 0) {
+            window.__grok_response = els[els.length - 1].textContent;
+        }
+    })()
+    """)
+
+    text_parts = []
+    chunk_size = 2000
+    for offset in range(0, 100000, chunk_size):
+        chunk = await cdp.evaluate_json(f"""
+        (() => {{
+            const t = window.__grok_response || '';
+            return {{ chunk: t.substring({offset}, {offset + chunk_size}), done: t.length <= {offset + chunk_size} }};
+        }})()
+        """)
+        if chunk:
+            text_parts.append(chunk.get("chunk", ""))
+            if chunk.get("done"):
+                break
+
+    return "".join(text_parts)
+
+
+async def main():
+    content = _resolve_content(sys.argv[1:])
+
+    # Find existing Grok tab, or create one in the background
+    tab = _find_grok_tab()
+    close_after = False
+
+    if tab:
+        target_id = tab.get("id")
+        ws_url = tab.get("webSocketDebuggerUrl")
+    else:
+        target_id, ws_url = await _create_background_tab()
+        close_after = True
+
+    if not ws_url:
+        print("Error: No WebSocket URL for Grok tab", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        async with CDPClient(ws_url) as cdp:
+            # Wait if Grok is currently generating a response
+            await _wait_until_idle(cdp)
+
+            # Force new conversation: go home first, then to new chat
+            await cdp.navigate("https://grok.com/")
+            await asyncio.sleep(1)
+            await cdp.navigate("https://grok.com/c#private")
+
+            # Wait for ProseMirror editor (up to 15s)
+            for attempt in range(15):
+                result = await cdp.evaluate_json(
+                    'document.querySelector(".ProseMirror") ? {ready:true} : {ready:false}'
+                )
+                if result and result.get("ready"):
+                    break
+                await asyncio.sleep(1)
+
+            await _inject_and_submit(cdp, content)
+            response = await _wait_for_response(cdp)
+            if response:
+                print(response)
+    finally:
+        if close_after and target_id:
+            await _close_tab(target_id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
