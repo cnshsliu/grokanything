@@ -1,5 +1,9 @@
 # grokanything
 
+<p align="center">
+  <img src="./grokanything-logo.webp" alt="grokanything logo" width="200">
+</p>
+
 Send questions or file content to Grok via Chrome DevTools Protocol (CDP).
 
 ## Requirements
